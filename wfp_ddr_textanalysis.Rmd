@@ -1,0 +1,745 @@
+---
+title: "WFP - DDR Text Analysis"
+author: "Maria Antonia Bravo"
+date: '2022-04-20'
+output: html_document
+---
+## Preliminary Data Collection and Analysis
+
+### Set-Up Code
+
+```{r setup, include=FALSE}
+# If packages are not donwloaded, enter the code in the console or 
+# here below with the name of the package
+#install.packages("name_package")
+
+# For data wrangling
+library("tidyverse")
+library("lubridate")
+library("readxl")
+# For text analysis
+library("pdftools")
+library("stringr")
+library("quanteda")
+library("readtext")
+library("quanteda.textmodels")
+library("quanteda.textplots")
+library("quanteda.textstats")
+library("kableExtra")
+
+# For SQL
+library(DBI)
+library(RSQLite)
+
+# Set syse
+Sys.setenv(LANG = "en")
+```
+
+### Setting-up the environment
+1. The PDFs, .txt or .DOCX files are parsed into R using the `pdf_text` function which returns a character vector with one row corresponding to one page. In the code chunk below we set the working directory, read in the files (no need to decompress) and identify key docvars - year and news source.
+```{r}
+# Make sure to set your working directory to the folder where your data resides. 
+setwd("~/DPA/WFP DDR/Text Analysis")
+
+# Create or load the SQLite database to store the data
+db <- dbConnect(RSQLite::SQLite(), "~/DPA/WFP DDR/Text Analysis/dfm_wfp_ddr_ecuador.sqlite")
+dbListTables(db)
+#dbRemoveTable(db, "acrs and sprs")
+```
+
+### Extracting Data
+Do not run this function if you've already saved your data in a SQL database
+```{r eval=FALSE}
+trim <- function (x) gsub("^\\s+|\\s+$", "", x)
+
+QTD_COLUMNS <- 2
+read_text <- function(text) {
+  result <- ''
+  #Get all index of " " from page.
+  lstops <- gregexpr(pattern =" ",text)
+  #Puts the index of the most frequents ' ' in a vector.
+  stops <- as.integer(names(sort(table(unlist(lstops)),decreasing=TRUE)[1:2]))
+  #Slice based in the specified number of colums (this can be improved)
+  for(i in seq(1, QTD_COLUMNS, by=1))
+  {
+    temp_result <- sapply(text, function(x){
+      start <- 1
+      stop <-stops[i] 
+      if(i > 1)            
+        start <- stops[i-1] + 1
+      if(i == QTD_COLUMNS)#last column, read until end.
+        stop <- nchar(x)+1
+      substr(x, start=start, stop=stop)
+    }, USE.NAMES=FALSE)
+    temp_result <- trim(temp_result)
+    result <- append(result, temp_result)
+  }
+  result
+}
+
+# Get a vector with the location of the directory
+
+# Modifying read pdf function in order to correctly read columns
+extract_data <- function(file_names) {
+  docs <- data.frame(text = NA, page = NA, doc_name = NA, year = NA)
+  
+  for (fl in file_names) {
+    # Read into list, each page is a different list item
+    
+    print(fl)
+    
+    if(grepl('.doc', fl) == TRUE){
+      
+      text <- as.data.frame(readtext::readtext(fl))
+      text <- str_split(text$text, pattern = "\n")[[1]]
+      text <- text[nzchar(text)]
+      text <- str_squish(text)
+      text <- paste0(text ,collapse = " ")
+      temp <- data.frame(page = NA)
+      temp$doc_name <- word(basename(fl), start = 1,end = 3,sep = "_")
+      temp$text <- text
+      temp$year <- as.numeric(str_extract(basename(fl),
+                                                "(\\d{4})"))
+
+    } else {
+
+    text <- pdf_text(fl)
+    temp <- data.frame(page = 1:length(text))
+    temp$doc_name <- word(basename(fl), start = 1,end = 3,sep = "_")
+    temp$text <- NA
+    temp$year <- as.numeric(str_extract(basename(fl),
+                                                "(\\d{4})"))
+    for (i in 1:length(text)) { 
+      result <- ''
+      page <- text[i]
+      t1 <- unlist(strsplit(page, "\n"))      
+      maxSize <- max(nchar(t1))
+      t1 <- paste0(t1,strrep(" ", maxSize-nchar(t1)))
+      result <- append(result,read_text(t1))
+      result <- result[nzchar(result)]
+      result <- str_squish(result[1:length(result)-1])
+      result <- paste0(result ,collapse = " ")
+      result
+      temp[i,]$text <- result
+    }
+    }
+
+  docs <- rbind(docs, temp)
+  }
+  return(docs)
+  }
+
+# ACRs and SPRs
+fls <- list.files("C:/Users/maria/OneDrive/Documents/DPA/WFP DDR/Text Analysis/Ecuador/ACRs and SPRs", full.name= TRUE, recursive = TRUE, all.files = TRUE, ignore.case = TRUE)
+docs <- extract_data(fls)
+docs <- docs[2:nrow(docs),]
+
+# CSPs and Budget Revisions
+fls_csps <- list.files("C:/Users/maria/OneDrive/Documents/DPA/WFP DDR/Text Analysis/Ecuador/CountryStrategicPlan_BudgetRevisions", full.name= TRUE, recursive = TRUE, all.files = TRUE, ignore.case = TRUE)
+docs <- extract_data(fls_csps)
+
+# Pre-CSPs Strategic Documents
+fls_pre_csps <- list.files("C:/Users/maria/OneDrive/Documents/DPA/WFP DDR/Text Analysis/Ecuador/Pre_CSP_Operations", full.name= TRUE, recursive = TRUE, all.files = TRUE, ignore.case = TRUE)
+docs <- extract_data(fls_pre_csps)
+```
+
+### Further pre-processing
+```{r eval=FALSE}
+# Delete duplicates
+docs <- unique(docs)
+docs <- docs %>%
+  filter(!is.na(text))
+
+docs$length <- str_count(docs$text)
+
+# REMOVING HTML TAGS
+docs$text <- gsub("<.*?>", "", docs$text)
+docs$text <- gsub("(\r\n|\r|\n)", " ", docs$text)
+docs$text <- gsub("(\")", "", docs$text)
+
+#docs[-c(grep('table of contents', docs$text, ignore.case = TRUE)), ]
+docs$doc_id <- paste0(docs$doc_name, "_", docs$page)
+
+# Remove text with less than 300 words
+docs <- docs %>%
+  filter(length > 300)
+```
+
+### Save it to the SQL Database
+```{r eval=FALSE}
+dbWriteTable(db, 'pre_csps', docs, overwrite = TRUE)
+```
+
+### Load the data from SQL
+```{r}
+# Query db to get table
+dbListTables(db)
+
+acrs <- dbGetQuery(db, 
+                   "SELECT * FROM 'acrs and sprs'")
+
+csps <- dbGetQuery(db, 
+                   "SELECT * FROM 'csps'")
+
+others <- dbGetQuery(db, 
+                   "SELECT * FROM 'pre_csps'")
+
+docs <- rbind(acrs, csps)
+docs <- rbind(docs, others)
+
+# REMOVING HTML TAGS
+docs$text <- gsub("<.*?>", "", docs$text)
+docs$text <- gsub("(\r\n|\r|\n)", " ", docs$text)
+docs$text <- gsub("(\")", "", docs$text)
+
+docs$doc_name_short <- word(docs$doc_name, 1, sep = ' ')
+
+rm(acrs, csps, others)
+dbDisconnect(db)
+rm(db)
+```
+
+# Quanteda: Text Analysis
+## Creating a quanteda corpus
+Next, we create a quanteda corpus which will enable us to perform the analysis.
+```{r}
+# 1. Create quanteda DFM 
+# Only keep articles greater than 300 words (eliminating for example, table of contents)
+toks <- docs %>%
+  corpus(docid_field = 'doc_id') %>%
+             tokens(remove_symbols = TRUE, remove_url = TRUE, what = 'sentence')  
+
+toks_docs <- docs %>%
+  select(doc_name_short, text) %>%
+  group_by(doc_name_short) %>%
+  mutate(all_text = paste0(text, collapse = ' ')) %>%
+  select(doc_name_short, all_text) %>%
+  unique() %>%
+  corpus(text_field = 'all_text', docid_field = 'doc_name_short') %>%
+  tokens(remove_symbols = TRUE, remove_url = TRUE)
+
+dfm_docs <- docs %>%
+  corpus(docid_field = 'doc_id') %>%
+             tokens(remove_symbols = TRUE, remove_url = TRUE, remove_separators = TRUE) %>%
+  tokens(remove_numbers = TRUE, padding = TRUE) %>%
+  tokens_remove(stopwords("en"), padding = TRUE) %>%
+  tokens_remove(c("world_food_programme", "world", "food", "programme", "world_food", "food_programme", "wfp"), padding = TRUE) %>%
+  tokens(remove_punct = TRUE, padding = TRUE)%>%
+  tokens_ngrams(1:3)%>%
+  dfm()
+
+colloc_toks <- docs %>%
+  select(doc_name_short, text) %>%
+  group_by(doc_name_short) %>%
+  mutate(all_text = paste0(text, collapse = ' ')) %>%
+  select(doc_name_short, all_text) %>%
+  unique() %>%
+  corpus(text_field = 'all_text', docid_field = 'doc_name_short') %>%
+  tokens(remove_symbols = TRUE, remove_url = TRUE, remove_punct = TRUE) %>%
+  tokens_remove(stopwords('en')) %>%
+  tokens_ngrams(1:2) 
+
+head(dfm_docs)
+```
+
+# Descriptive Statistics
+## Examine top features
+```{r}
+# Examine the top features in the corpus. Set n to different values to see n-words.
+topfeatures(dfm_docs, n=25)
+
+# Quicly plot a wordcloud to examine top features 
+textplot_wordcloud(dfm_docs, rotation=0, min_size=.75, max_size=3, max_words=50)
+```
+
+---------------------------------------------------------------------------------------------
+
+# COUNTRY CASE STUDIES
+Understanding the output:
+
+* docname: file name as in the e-library shared by WFP. If last character after _ is a number, then when possible (i.e, mostly for PDF documents), this includes the page in which the mention was found. This should make cross-referencing and further reading simpler. 
+* pre: sentence/word preceding the match
+* pos: sentence/word following the match
+* pattern: word which was matched based on keyword
+* climate_change_relevance: binary variable, 1 if the sentences in which the word policy occurs also includes the words in clim_words, 0 otherwise. 
+* drr_relevance: binary variable, 1 if the sentences in which the word policy occurs also includes the words in drr_words, 0 otherwise. 
+* from & to include the positions of the sentence in which the keyword occurs (this isn't significant for the purpose of this analysis)
+
+## EQ 2.1 
+### To what extent has the DRR/M Policy contributed to reducing disaster risk and strengthening resilience to shocks through activities such as: analysis, assessment and monitoring; emergency preparedness and response; building resilience; capacity strengthening; coordination and leadership? 
+
+#### What is the scope under which DDR/M and CC are mentioned across country documentation? 
+
+* KWIC - Retrieves the mentions of drr-related keywords and cc-related keywords. Helpful mostly for contextual information (understanding the scope and role that DDR and CC activities play in the country)
+```{r}
+# Looking at mentions in general
+drr_keywordsearch <- as.data.frame(kwic(toks, pattern = phrase(c("disaster*", "drr", "risk management")), valuetype = "regex", case_insensitive = TRUE, window = 1))
+
+kbl(drr_keywordsearch) %>%
+  kable_classic(full_width = F)%>%
+  scroll_box(width = "100%", height = "500px")
+
+cc_keywordsearch <- as.data.frame(kwic(toks, pattern = phrase(c("clima*")), valuetype = "regex", case_insensitive = TRUE, window = 1))
+
+kbl(cc_keywordsearch) %>%
+  kable_classic(full_width = F)%>%
+  scroll_box(width = "100%", height = "500px")
+```
+
+
+
+* Lexical dispersion plot, which allows to visualize the occurrences of particular terms across the text. It shows frequency counts (not proportions) and can be helpful to identify which documents are more informative or discuss the topics researchers are interested in. 
+```{r}
+# Lexical dispersion plots for keywords
+## DRR
+kwic(toks_docs, pattern = phrase(c("disaster*")), valuetype = "regex", case_insensitive = TRUE, window = 1) %>%
+  textplot_xray()
+
+## Climate chage
+kwic(toks_docs, pattern = phrase(c("clima*")), valuetype = "regex", case_insensitive = TRUE, window = 1) %>%
+  textplot_xray()
+
+print(unique(docs$doc_name))
+```
+
+
+* Top Features and Word Clouds allow researchers to quickly examine which other words most often occur in the sentence in which the keyword occurs in.  
+```{r}
+# What are the top words in the sentences that include keywords?
+## Disaster-risk reduction
+drr_dfm <- drr_keywordsearch$keyword %>%
+  tokens(remove_punct = TRUE, remove_numbers = TRUE, remove_symbols = TRUE, remove_url = TRUE) %>%
+  tokens_remove(stopwords('en')) %>%
+  tokens_remove(pattern = c('wfp', 'food', 'nutrition')) %>%
+  tokens_ngrams(1:2) %>%
+  dfm() 
+
+print(drr_dfm %>%
+  topfeatures(n = 25))
+
+{ drr_dfm %>%
+  textplot_wordcloud(rotation=0, min_size=.75, max_size=3, max_words=25)
+  title(main = "DRR - Top Words in Sentence Matches")
+  }
+
+## Climate change
+cc_dfm <- cc_keywordsearch$keyword %>%
+  tokens(remove_punct = TRUE, remove_numbers = TRUE, remove_symbols = TRUE, remove_url = TRUE) %>%
+  tokens_remove(stopwords('en')) %>%
+  tokens_remove(pattern = c('wfp', 'food', 'nutrition')) %>%
+  tokens_ngrams(1:2) %>%
+  dfm() 
+
+print(cc_dfm %>%
+  topfeatures(n = 25))
+
+{ cc_dfm %>%
+  textplot_wordcloud(rotation=0, min_size=.75, max_size=3, max_words=25)
+  title(main = "Climate - Top Words in Sentence Matches")
+  }
+
+
+# What are the top-bigrams including climate* and disaster*
+{ dfm_docs %>%
+  dfm_select(pattern = "clima*") %>%
+    textplot_wordcloud(rotation=0, min_size=.75, max_size=3, main =  "") 
+  title(main = "clima*")
+  }
+
+{ dfm_docs %>%
+  dfm_select(pattern = "disaster*") %>%
+    textplot_wordcloud(rotation=0, min_size=.75, max_size=3, main = "")
+title(main = "disaster*") 
+}
+
+```
+
+
+#### In which ways are the DDR/M and CC policies mentioned across key country documents (those that refer to results)?
+* Collocation analysis. Collocation traces the appearance of words that commonly appear next to each other in a text or series of text in order to analyze the words' importance. 
+```{r}
+colloc_toks %>%
+  tokens_select(pattern = "policy", valuetype = "regex", case_insensitive = TRUE, padding = TRUE)%>%
+  textstat_collocations(min_count = 2) %>% 
+  as.data.frame() %>%
+  arrange(desc(count)) %>%
+  kbl() %>%
+  kable_classic(full_width = F)%>%
+  scroll_box(width = "100%", height = "500px")
+```
+
+
+* KWIC - Retrieves the mentions in which the word 'policy' occurs throughout the documents. 
+```{r}
+clim_words <- c('climat*', 'environment*','natural hazard')
+drr_words <- c('disaster*', 'drr')
+clim <- paste(clim_words, collapse="|")
+dis <- paste(drr_words, collapse = "|")
+
+keywordsearch <- as.data.frame(kwic(toks, pattern = phrase("policy"), valuetype = "regex", window = 1, case_insensitive = TRUE)) 
+
+keywordsearch <- keywordsearch %>%
+  mutate(climate_change_relevance = ifelse(grepl(clim, keyword, perl = TRUE, ignore.case = TRUE), 1, 0)) %>%
+  mutate(drr_relevance = ifelse(grepl(dis, keyword, perl = TRUE, ignore.case = TRUE), 1, 0))
+  
+kbl(keywordsearch) %>%
+  kable_classic(full_width = F)%>%
+  scroll_box(width = "100%", height = "500px")
+
+# There is one mention of 'climate change policy' in the 2011 Country Strategy Document
+dfm_select(dfm_docs, pattern = 'climate_change_policy') %>%
+  as.data.frame() %>%
+  filter(climate_change_policy > 0)
+
+keywordsearch_precise <- as.data.frame(kwic(toks, pattern = phrase("climate change policy"), valuetype = "fixed", window = 1, case_insensitive = TRUE)) 
+# No matches here. After manual revision, there is indeed no match (false positive may have been given column reading errors)
+
+dfm_select(dfm_docs, pattern = c('drr_policy', 'risk_policy', 'reduction_policy'))
+# No matches here. 
+```
+From the collocation analysis, we can see that there is not mention of either policy in the country documentation.
+
+
+#### What results and objectives related to DDR/M and CC are mentioned across key country documents?
+* Frequency analysis, KWIC, dictionary search
+```{r}
+# Early Warning
+early_warning_results <- as.data.frame(kwic(toks, pattern = 'early * warning', valuetype = "regex", window = 1, case_insensitive = TRUE)) %>%
+  unique()
+
+early_warning_results %>%  
+  kbl() %>%
+  kable_classic(full_width = F) %>%
+  scroll_box(width = "100%", height = "500px")
+
+# Risk Management
+risk_management_results <- as.data.frame(kwic(toks, pattern = 'risk * management', valuetype = "regex", window = 1, case_insensitive = TRUE)) %>%
+  unique()
+
+risk_management_results %>%  
+  kbl() %>%
+  kable_classic(full_width = F) %>%
+  scroll_box(width = "100%", height = "500px")
+
+# Forecast Based Finance
+forecast <- dictionary(list(forecast_based	= c("forecast based", "forecast-based", "fbf")))
+forecast_results <- as.data.frame(kwic(toks, pattern = forecast, valuetype = "regex", window = 1, case_insensitive = TRUE)) %>%
+  unique()
+
+forecast_results %>%  
+  kbl() %>%
+  kable_classic(full_width = F) %>%
+  scroll_box(width = "100%", height = "500px")
+
+# Risk Finance
+risk_finance <- as.data.frame(kwic(toks, pattern = 'risk financ*', valuetype = "regex", window = 1, case_insensitive = TRUE)) %>%
+  unique()
+print('No matches for risk finance')
+
+risk_finance %>% 
+  kbl() %>%
+  kable_classic(full_width = F) %>%
+  scroll_box(width = "100%", height = "500px")
+
+# Risk Insurance
+risk_insurance <- as.data.frame(kwic(toks, pattern = 'risk insurance', valuetype = "regex", window = 1, case_insensitive = TRUE)) %>%
+  unique()
+print('No matches for risk insurance')
+
+risk_insurance %>% 
+  kbl() %>%
+  kable_classic(full_width = F) %>%
+  scroll_box(width = "100%", height = "500px")
+
+# Climate Services
+clim_services_results <- rbind(as.data.frame(kwic(toks, pattern = "climate proof*", valuetype = "regex", window = 1, case_insensitive = TRUE)) %>% unique(), 
+                               as.data.frame(kwic(toks, pattern = "mainstream* climate", valuetype = "regex", window = 1, case_insensitive = TRUE)) %>% unique(), 
+                               as.data.frame(kwic(toks, pattern = "climate strateg*", valuetype = "regex", window = 1, case_insensitive = TRUE)) %>% unique(), 
+                               as.data.frame(kwic(toks, pattern = "climate servic*", valuetype = "regex", window = 1, case_insensitive = TRUE)) %>% unique())
+
+clim_services_results %>% 
+  kbl() %>%
+  kable_classic(full_width = F) %>%
+  scroll_box(width = "100%", height = "500px")
+
+# Climate Finance
+clim_finance_results <- rbind(as.data.frame(kwic(toks, pattern = "climate * fund", valuetype = "regex", window = 1, case_insensitive = TRUE)), 
+                              as.data.frame(kwic(toks, pattern = "climate * financ*", valuetype = "regex", window = 1, case_insensitive = TRUE))) %>%
+  unique()
+
+clim_finance_results %>% 
+  kbl() %>%
+  kable_classic(full_width = F) %>%
+  scroll_box(width = "100%", height = "500px")
+
+# Climate Risk
+climate_risk_results <- as.data.frame(kwic(toks, pattern = 'climate risk*', valuetype = "regex", window = 1, case_insensitive = TRUE)) %>%
+  unique()
+
+climate_risk_results %>% 
+  kbl() %>%
+  kable_classic(full_width = F) %>%
+  scroll_box(width = "100%", height = "500px")
+
+# Emergency Preparedness and Response
+epr_results <- rbind(as.data.frame(kwic(toks, pattern = " epr ", valuetype = "regex", window = 1, case_insensitive = TRUE)), 
+                              as.data.frame(kwic(toks, pattern = "emergency preparedness", valuetype = "regex", window = 1, case_insensitive = TRUE))) %>%
+  unique()
+
+epr_results %>% 
+  kbl() %>%
+  kable_classic(full_width = F) %>%
+  scroll_box(width = "100%", height = "500px")
+
+# Food for Assets
+ffa_results <- rbind(as.data.frame(kwic(toks, pattern = " ffa ", valuetype = "regex", window = 1, case_insensitive = TRUE)),
+             as.data.frame(kwic(toks, pattern = "food for asset*", valuetype = "regex", window = 1, case_insensitive = TRUE))) %>%
+  unique()
+
+ffa_results %>% 
+  kbl() %>%
+  kable_classic(full_width = F) %>%
+  scroll_box(width = "100%", height = "500px")
+
+# NAPs & NDCs
+ndc_results <- rbind(as.data.frame(kwic(toks, pattern = " ndc* ", valuetype = "regex", window = 1, case_insensitive = TRUE)),
+             as.data.frame(kwic(toks, pattern = "nationally determined contribution*", valuetype = "regex", window = 1, case_insensitive = TRUE)), 
+             as.data.frame(kwic(toks, pattern = " nap ", valuetype = "regex", window = 1, case_insensitive = TRUE)),
+             as.data.frame(kwic(toks, pattern = "national adaptation plan*", valuetype = "regex", window = 1, case_insensitive = TRUE))) %>%
+  unique()
+
+ndc_results %>%
+  kbl() %>%
+  kable_classic(full_width = F) %>%
+  scroll_box(width = "100%", height = "500px")
+```
+
+
+# EQ 2.2 
+#### To what extent has the Climate Change Policy contributed to results in the following areas: food security analysis, anticipatory action and climate services; emergency preparedness, response and recovery; and building community resilience, risk reduction, social protection and adaptation.
+
+## Frequency of works and key words in context (KWIC)
+Search for frequency of specific words (does not use dfm but df with text column)
+Tip: use regular expressions to make sure your searches return all relevant results.
+
+```{r}
+# Count the number of instances of a word
+length(grep('clim*', docs$text, ignore.case = TRUE))
+
+length(grep('climate change', docs$text, ignore.case = TRUE))
+
+# See the keywords in context. Beware that dimensionality grows rapidly if its a very common
+# keyword as it select all instances of the string. 
+
+#tokens_news <- tokens(news_corpus[1:10]) #restrict search if it is very common
+keywordsearch <- kwic(toks, pattern = phrase("climate change"), valuetype = "regex", window = 15) #uncomment if you want to save query
+
+kbl(keywordsearch) %>%
+  kable_classic(full_width = F) %>%
+  kable_paper(html_font = "TT Times New Roman")
+
+keywordsearch_one <- kwic(toks, pattern = phrase("disaster"), valuetype = "regex", window = 20) #uncomment if you want to save query
+
+kbl(keywordsearch_one) %>%
+  kable_classic(full_width = F) %>%
+  kable_paper(html_font = "TT Times New Roman")
+```
+
+```{r}
+### keep only certain words
+drr <- dfm_keep(dfm_docs, pattern = "disaster*|DRR|drr", verbose = FALSE) 
+head(drr)
+drr_df <- convert(drr, to = "data.frame")
+
+kbl(head(drr_df)) %>%
+  kable_classic(full_width = F) %>%
+  kable_paper(html_font = "TT Times New Roman")
+
+climate <- dfm_keep(dfm_docs, pattern = "climat*", verbose = FALSE)
+head(climate)
+clim_df
+```
+
+```{r}
+clim_words <- read.csv('words.csv', sep=";")
+clim_words <- clim_words[2:nrow(clim_words), ]
+names(clim_words) <- c('word', 'keep')
+clim_words <- clim_words %>% 
+  filter(keep == TRUE)
+  
+features_cc <- textstat_frequency(dfm_select(climate_ngram, pattern = clim_words$word, case_insensitive = FALSE), n = 50, groups = year)
+features_cc <- features_cc %>%
+  filter(frequency > 2)
+
+features_cc$feature <- with(features_cc, reorder(feature, -frequency))
+
+ggplot(features_cc, aes(x = feature, y = frequency, color= group)) +
+    geom_point() + 
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  coord_flip()
+
+ggplot(features_cc, aes(x = group, y = frequency, group = 1)) +
+    geom_line() + 
+  geom_point()+
+  facet_wrap(vars(feature)) + 
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ylab("Number of Mentions") +
+  xlab("Year") +
+  labs(title = "Number of Keyword Mentions Related to Climate Change in APRs (2011-2020)") + 
+  theme_classic() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r}
+docvars(climate_ngram)
+docnames(climate_ngram)
+
+climate_ngram %>%
+  dfm_select(pattern = clim_words$word) %>%
+  dfm_subset(year > 2015) %>%
+  dfm_group(groups = year) %>%
+  textplot_wordcloud(comparison = TRUE, max_words = 200)
+
+climate_ngram %>%
+  dfm_select(pattern = clim_words$word) %>%
+  dfm_subset(year < 2015) %>%
+  dfm_group(groups = year) %>%
+  textplot_wordcloud(comparison = TRUE, max_words = 200)
+```
+
+```{r} 
+disaster <- dfm_keep(dfm_aprs, pattern = "disaster", verbose = FALSE) # keep only words containing disaster
+
+disaster_ngram <- dfm_keep(dfm_aprs_ngram, pattern = "disaster", verbose = FALSE) # keep only words containing disaster
+
+climate_ngram$year <- c(2011, 2012, 2013, 2014, 2014, 2016, 2017, 2018, 2019, 2020)
+
+
+head(climate)
+clim_df <- convert(climate, to = "data.frame")
+```
+
+
+```{r}
+### see which words climate is being used with
+toks_clim_bigram <- tokens_compound(toks_aprs, phrase("climate *")) %>%
+  tokens_select(pattern = phrase("climate_*"))
+
+head(toks_clim_bigram)
+
+dfm_cc_years <- dfm(toks_clim_bigram) %>%
+  dfm_trim(min_termfreq=2)
+
+toks_disaster_bigram <- tokens_compound(toks_aprs, phrase("disaster *")) %>%
+  tokens_select(pattern = phrase("disaster_*"))
+
+head(toks_disaster_bigram)
+
+dfm_cc_years <- dfm(toks_clim_bigram) %>%
+  dfm_trim(min_termfreq=2)
+
+#### Extract word usage
+cc_usage_years <- convert(dfm_cc_years, to = "data.frame") %>%
+  separate(doc_id, into = c("year", "docname"), sep = "_")
+
+write.csv(cc_usage_years, "~/DPA/WFP DDR/Text Analysis/usage_cc_years.csv", row.names=FALSE)
+```
+
+
+# Strategic Plans
+## Trying it in a specific set of documents
+```{r}
+# Trial on Annual Performance Reports
+strategic_plans <- filter_files[which(str_detect(filter_files, "Strategic Plan (2"))]
+
+extract_data(strategic_plans, doc_format = ".pdf", table_name = "strategic_plans_pdf")
+
+# Load data
+strategic_plans <- dbGetQuery(db, 
+                   "SELECT *
+                   FROM strategic_plans_pdf")
+
+# Create tokenized object
+toks_sps <- corpus(strategic_plans) %>%
+             tokens(remove_punct = TRUE, remove_symbols = TRUE, remove_url = TRUE)
+
+# Create a bi-grame tokenized object
+toks_sps_ngram <- tokens_ngrams(toks_sps, n=2:3)
+
+# Create document feature matrix
+dfm_sps <- dfm(toks_sps, remove = stopwords('en'))
+head(dfm_sps)
+
+# Analysis
+
+## Lexical Evolution: See how a key topic is being treated
+
+### see keywords in context
+kw_climate <- kwic(toks_sps, pattern = phrase("climate change"))
+
+### keep only certain words
+dfm_keep(dfm_sps, pattern = "climat*", verbose = FALSE) # keep only words ending in "s"
+dfm_keep(dfm_sps, pattern = "disaster", verbose = FALSE) # keep only words containing disaster
+
+### see which words climate is being used with
+toks_clim_bigram <- tokens_compound(toks_aprs, phrase("climate *")) %>%
+  tokens_select(pattern = phrase("climate_*"))
+
+head(toks_clim_bigram)
+
+dfm_cc_years <- dfm(toks_clim_bigram) %>%
+  dfm_trim(min_termfreq=2)
+
+
+#### Extract word usage
+cc_usage_years <- convert(dfm_cc_years, to = "data.frame") %>%
+  separate(doc_id, into = c("year", "docname"), sep = "_")
+
+write.csv(cc_usage_years, "~/DPA/WFP DDR/Text Analysis/usage_cc_years.csv", row.names=FALSE)
+
+## Dictionary Look-Up of Findings
+myDict <- dictionary(list(christmas = c("Christmas", "Santa", "holiday"),
+                          opposition = c("Opposition", "reject", "notincorpus"),
+                          taxglob = "tax*",
+                          taxregex = "tax.+$",
+                          country = c("United_States", "Sweden")))
+```
+
+# SpacyR - Named-Entity Recognition
+
+```{r}
+#library(reticulate)
+#devtools::install_github("quanteda/spacyr", build_vignettes = FALSE)
+
+library("spacyr")
+#spacy_install()
+spacy_initialize(model = "en_core_web_lg", save_profile = TRUE)
+```
+
+```{r}
+# Note - The number of documents it can parse is low since it tokenizes into a df - high dimensional. 
+sample_text <- news$text[1:10]
+parsedtxt <-spacy_parse(sample_text, tag = TRUE, entity = TRUE, lemma = FALSE, nounphrase = TRUE)
+
+entities <- entity_extract(parsedtxt)
+
+entities_two <- nounphrase_extract(parsedtxt)
+
+# This function tends to take less time. 
+entities_all <- spacy_extract_entity(tolower(news$text[1:20]))
+
+entities_all %>%
+  filter(ent_type == "PERSON")
+
+entities_all %>%
+  filter(ent_type == "ORG")
+
+spacy_finalize()
+```
+
+```{r}
+#  Semantic Tagging
+doc <- 'The results indicate that'
+xml2::xml_attr(doc, attr = 'usas')
+
+```
